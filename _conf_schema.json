@@ -70,5 +70,31 @@
     "type": "bool",
     "default": false,
     "hint": "开启此选项会对图片应用遮罩处理，关闭则发送原图。此配置仅影响 Telegram 平台。"
+  },
+  "auto_recall": {
+    "description": "倒计时自动撤回预览消息",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，插件发送的预览消息将在倒计时结束后自动撤回。仅支持 QQ(aiocqhttp) 平台，其他平台自动忽略。"
+  },
+  "recall_delay": {
+    "description": "自动撤回倒计时(秒)",
+    "type": "int",
+    "default": 60,
+    "slider": {
+      "min": 0,
+      "max": 120,
+      "step": 5
+    },
+    "hint": "预览消息发送后多少秒撤回，范围 0-120。设为 0 表示立即撤回。超过 120 秒 QQ 风控会拒绝撤回。"
+  },
+  "recall_whitelist": {
+    "description": "自动撤回会话白名单",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "留空表示所有会话的预览消息都撤回。填写群号或私聊用户 ID 时，仅撤回列表内会话的预览消息。"
   }
 }

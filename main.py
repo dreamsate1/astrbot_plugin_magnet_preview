@@ -17,6 +17,7 @@ from astrbot.api.message_components import Plain, Node, Nodes
 DEFAULT_WHATSLINK_URL = "https://whatslink.info"
 DEFAULT_TIMEOUT = 10
 MAX_FORWARD_DEPTH = 5
+MAX_RECALL_DELAY = 120  # 撤回倒计时上限：120 秒（QQ 风控对超时消息撤回会失败）
 
 FILE_TYPE_MAP = {
     "folder": "📁 文件夹",
@@ -43,6 +44,13 @@ class MagnetPreviewer(Star):
         self.auto_parse = config.get("auto_parse", True)
         self.enable_emoji_reaction = config.get("enable_emoji_reaction", True)
         self.mask_media_for_telegram = config.get("mask_media_for_telegram", False)
+        self.auto_recall = config.get("auto_recall", False)
+        self.recall_delay = max(
+            0, min(MAX_RECALL_DELAY, int(config.get("recall_delay", 60)))
+        )
+        self.recall_whitelist = [
+            str(sid) for sid in config.get("recall_whitelist", [])
+        ]
         self.session_whitelist = [
             str(sid) for sid in config.get("session_whitelist", [])
         ]
@@ -65,6 +73,8 @@ class MagnetPreviewer(Star):
             r"\b(?:https?://|www\.)[^\s<>'\"`]+", re.IGNORECASE
         )
         self._link_cache: dict = {}
+        # 倒计时撤回任务引用，避免长倒计时期间任务被垃圾回收
+        self._recall_tasks: set = set()
 
     async def terminate(self):
         logger.info("磁链预览插件已终止")
@@ -293,6 +303,182 @@ class MagnetPreviewer(Star):
     def _is_telegram_platform(self, event: AstrMessageEvent) -> bool:
         """当前是否为 Telegram 平台"""
         return self._get_platform_name(event) == "telegram"
+
+    def _should_recall(self, event: AstrMessageEvent) -> bool:
+        """是否撤回：仅 QQ(aiocqhttp) 平台，且总开关、倒计时、会话白名单均通过。"""
+        if not self.auto_recall or self.recall_delay <= 0:
+            return False
+        if not self._is_aiocqhttp_platform(event):
+            return False
+        if self.recall_whitelist:
+            session_id = event.get_group_id() or event.get_sender_id()
+            if not session_id:
+                return False
+            session_id = str(session_id).split("#")[0]
+            return session_id in self.recall_whitelist
+        return True
+
+    def _schedule_recall(self, event: AstrMessageEvent, message_ids):
+        """倒计时撤回一批已发送的消息；至少撤回成功一条时发送提示，失败仅记录日志。"""
+        if not message_ids:
+            return
+
+        async def _recall_job():
+            await asyncio.sleep(self.recall_delay)
+            recalled_any = False
+            for mid in message_ids:
+                try:
+                    await self._recall_message(event, mid)
+                    logger.debug(f"[磁链预览] 已自动撤回消息 {mid}")
+                    recalled_any = True
+                except Exception as e:
+                    logger.warning(f"[磁链预览] 自动撤回消息 {mid} 失败: {e}")
+            if recalled_any:
+                await self._send_recall_notice(event)
+
+        try:
+            task = asyncio.get_running_loop().create_task(_recall_job())
+            self._recall_tasks.add(task)
+            task.add_done_callback(self._recall_tasks.discard)
+        except RuntimeError:
+            logger.warning("[磁链预览] 无运行中的事件循环，跳过自动撤回")
+
+    async def _send_recall_notice(self, event: AstrMessageEvent):
+        """撤回成功后发送提示消息。"""
+        try:
+            await self._send_with_ids(
+                event, MessageChain([Plain(text="已经撤回磁力链接～")])
+            )
+        except Exception as e:
+            logger.warning(f"[磁链预览] 发送撤回提示失败: {e}")
+
+    async def _recall_message(self, event: AstrMessageEvent, message_id):
+        """调用 QQ(aiocqhttp) 平台的撤回 API。"""
+        bot = getattr(event, "bot", None)
+        if not bot:
+            raise RuntimeError("无法获取 bot 实例")
+        # OneBot 11 标准 delete_msg 对群聊/私聊消息统一撤回；
+        # 部分协议端（如 NapCat）对私聊消息需用 delete_friend_msg
+        try:
+            await bot.api.call_action("delete_msg", message_id=int(message_id))
+        except Exception as e:
+            if not event.get_group_id():
+                await bot.api.call_action(
+                    "delete_friend_msg",
+                    user_id=int(event.get_sender_id()),
+                    message_id=int(message_id),
+                )
+            else:
+                raise e
+
+    async def _send_and_schedule_recall(
+        self, event: AstrMessageEvent, message: MessageChain
+    ):
+        """发送消息并按配置安排倒计时撤回（非 QQ 平台或未开启撤回时原样发送）。"""
+        message_ids = await self._send_with_ids(event, message)
+        if message_ids:
+            self._schedule_recall(event, message_ids)
+
+    async def _send_with_ids(self, event: AstrMessageEvent, message: MessageChain):
+        """以能拿到 message_id 的方式发送 QQ 消息，返回 message_id 列表（可能为空）。"""
+        if not self._should_recall(event):
+            await event.send(message)
+            return []
+
+        bot = getattr(event, "bot", None)
+        if not bot:
+            await event.send(message)
+            return []
+
+        is_group = bool(event.get_group_id())
+        session_id = event.get_group_id() if is_group else event.get_sender_id()
+        routing_params = {}
+        raw_event = getattr(event.message_obj, "raw_message", None)
+        if raw_event is not None and hasattr(raw_event, "get"):
+            self_id = raw_event.get("self_id")
+            if self_id:
+                routing_params["self_id"] = self_id
+
+        message_ids = []
+        # 合并转发消息必须单独发送，普通消息走批量接口
+        send_one_by_one = any(
+            isinstance(seg, (Comp.Node, Comp.Nodes)) for seg in message.chain
+        )
+        if send_one_by_one:
+            for seg in message.chain:
+                if isinstance(seg, Comp.Nodes):
+                    payload = await seg.to_dict()
+                elif isinstance(seg, Comp.Node):
+                    payload = await (Comp.Nodes([seg])).to_dict()
+                else:
+                    payload = None
+
+                if payload is not None:
+                    if is_group:
+                        ret = await bot.api.call_action(
+                            "send_group_forward_msg",
+                            group_id=int(session_id),
+                            **routing_params,
+                            **payload,
+                        )
+                    else:
+                        ret = await bot.api.call_action(
+                            "send_private_forward_msg",
+                            user_id=int(session_id),
+                            **routing_params,
+                            **payload,
+                        )
+                    if ret and ret.get("message_id") is not None:
+                        message_ids.append(ret["message_id"])
+                else:
+                    ret = await self._aiocqhttp_send_plain_segment(
+                        bot, event, is_group, session_id, routing_params, seg
+                    )
+                    if ret and ret.get("message_id") is not None:
+                        message_ids.append(ret["message_id"])
+                    await asyncio.sleep(0.5)
+        else:
+            ret = await self._aiocqhttp_send_plain_segment(
+                bot, event, is_group, session_id, routing_params, message
+            )
+            if ret and ret.get("message_id") is not None:
+                message_ids.append(ret["message_id"])
+
+        return message_ids
+
+    async def _aiocqhttp_send_plain_segment(
+        self, bot, event, is_group, session_id, routing_params, content
+    ):
+        """通过 aiocqhttp 原生接口发送普通消息，返回包含 message_id 的响应。"""
+        message_chain = (
+            content if isinstance(content, MessageChain) else MessageChain([content])
+        )
+        try:
+            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+                AiocqhttpMessageEvent,
+            )
+
+            messages = await AiocqhttpMessageEvent._parse_onebot_json(message_chain)
+            if not messages:
+                return None
+        except Exception as e:
+            logger.warning(f"[磁链预览] 转换消息格式失败，回退默认发送: {e}")
+            await event.send(message_chain)
+            return None
+
+        if is_group:
+            return await bot.api.call_action(
+                "send_group_msg",
+                group_id=int(session_id),
+                message=messages,
+                **routing_params,
+            )
+        return await bot.api.call_action(
+            "send_private_msg",
+            user_id=int(session_id),
+            message=messages,
+            **routing_params,
+        )
 
     async def _send_telegram_album(
         self,
@@ -700,14 +886,18 @@ class MagnetPreviewer(Star):
                         )
 
             if not forward_nodes:
-                yield event.plain_result("⚠️ 未能生成有效的预览内容。")
+                await self._send_and_schedule_recall(
+                    event, MessageChain([Plain(text="⚠️ 未能生成有效的预览内容。")])
+                )
                 return
 
             merged_forward_message = Nodes(nodes=forward_nodes)
             if self._is_aiocqhttp_platform(event) and not (
                 self.output_as_link and not force_image_mode
             ):
-                await event.send(MessageChain([merged_forward_message]))
+                await self._send_and_schedule_recall(
+                    event, MessageChain([merged_forward_message])
+                )
                 return
         except Exception as e:
             logger.warning(f"图片模式发送失败，尝试回退到直链模式: {e}")
@@ -791,7 +981,9 @@ class MagnetPreviewer(Star):
         """统一处理直链重试和纯文本兜底。单条结果时直接降级为纯文本，不再伪造合并转发。"""
         if link_forward_nodes and len(all_results) > 1:
             try:
-                await event.send(MessageChain([Nodes(nodes=link_forward_nodes)]))
+                await self._send_and_schedule_recall(
+                    event, MessageChain([Nodes(nodes=link_forward_nodes)])
+                )
                 return
             except Exception as retry_error:
                 logger.error(f"直链合并转发重试失败: {retry_error}")
